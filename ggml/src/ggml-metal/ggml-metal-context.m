@@ -307,6 +307,13 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_metal_buffer_t metal_buffer = (ggml_metal_buffer_t) buffer->context;
+    if (!ggml_metal_buffer_is_shared(metal_buffer)) {
+        ggml_metal_buffer_set_tensor(metal_buffer, tensor, data, offset, size);
+        return;
+    }
+
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -325,6 +332,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        const bool queue_locked = ggml_metal_device_lock_queue(ctx->dev);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -347,6 +355,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         ctx->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
     }
 }
 
@@ -361,6 +370,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
+        const bool queue_locked = ggml_metal_device_lock_queue(ctx_src->dev);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -386,6 +396,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         ctx_src->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        ggml_metal_device_unlock_queue(ctx_src->dev, queue_locked);
 
         ggml_metal_event_wait(ctx_dst, ev_cpy);
 
@@ -463,6 +474,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+        const bool queue_locked = ggml_metal_device_lock_queue(ctx->dev);
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
@@ -526,6 +538,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
 
+                    ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
                     return GGML_STATUS_FAILED;
                 }
             }
@@ -541,6 +554,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
 
+                    ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
                     return GGML_STATUS_FAILED;
                 }
 
@@ -556,6 +570,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
                 if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
                     GGML_LOG_INFO("%s: command buffer %d aborted", __func__, i);
+                    ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
                     return GGML_STATUS_ABORTED;
                 }
 
@@ -567,6 +582,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             ctx->capture_started = false;
         }
+
+        ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -584,6 +601,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
+        const bool queue_locked = ggml_metal_device_lock_queue(ctx->dev);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
@@ -595,11 +613,13 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ctx->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
     }
 }
 
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
+        const bool queue_locked = ggml_metal_device_lock_queue(ctx->dev);
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
 
@@ -611,6 +631,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
         ctx->cmd_buf_last = cmd_buf;
 
         [cmd_buf retain];
+        ggml_metal_device_unlock_queue(ctx->dev, queue_locked);
     }
 }
 

@@ -293,6 +293,8 @@ ggml_metal_device_t ggml_metal_device_get(int device);
 
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
+bool   ggml_metal_device_lock_queue  (ggml_metal_device_t dev);
+void   ggml_metal_device_unlock_queue(ggml_metal_device_t dev, bool locked);
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 

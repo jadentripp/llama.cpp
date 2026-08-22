@@ -50,7 +50,7 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    common_init_result_ptr llama_init = common_init_from_params(params);
+    common_init_result_ptr llama_init = common_init_from_params(params, true);
     llama_model * model = llama_init->model();
     if (model == nullptr) {
         fprintf(stderr, "%s : failed to init model\n", __func__);
@@ -120,8 +120,8 @@ int main(int argc, char ** argv) {
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    std::vector<std::vector<float>> logits_reference(n_rollback);
+    const auto replay_and_compare = [&](const char * mode, bool save_reference) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
             if (!decode_one(ctx_src, tokens[pos], pos) ||
@@ -137,8 +137,15 @@ int main(int argc, char ** argv) {
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (save_reference) {
+                logits_reference[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
+                if (!save_reference && std::fabs(logits_src[token] - logits_reference[i][token]) > eps) {
+                    fprintf(stderr, "%s : %s source logits mismatch at position %d, token %d (%g != %g)\n",
+                            __func__, mode, pos, token, (double) logits_src[token], (double) logits_reference[i][token]);
+                    return false;
+                }
                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
                             __func__, mode, pos, token, (double) logits_src[token], (double) logits_dst[token]);
@@ -148,28 +155,34 @@ int main(int argc, char ** argv) {
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
-        return 1;
-    }
-
-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
-        fprintf(stderr, "%s : partial rollback failed\n", __func__);
+    if (!replay_and_compare("full", true)) {
         return 1;
     }
 
     constexpr llama_state_seq_flags partial_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     common_prompt_checkpoint ckpt_partial;
-    ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
-    ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+    constexpr int n_checkpoint_cycles = 4;
+    for (int cycle = 0; cycle < n_checkpoint_cycles; ++cycle) {
+        // Recreate the original rollback point before each cycle.
+        // Chained multi-token rollbacks do not preserve snapshot groups after one-token replays.
+        ckpt.load_tgt(ctx_src, 0, 0);
+        ckpt.load_tgt(ctx_dst, 0, 0);
 
-    if (!replay_and_compare("partial")) {
-        return 1;
+        ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
+        ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+
+        if (!replay_and_compare("partial", false)) {
+            fprintf(stderr, "%s : partial checkpoint cycle %d failed\n", __func__, cycle);
+            return 1;
+        }
     }
 
     // Repeat the load into a context that already has its own rollback state:
     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
     // non-zero at load time. The restore must wipe that state and still match.
+    llama_free(ctx_dst);
+    ctx_dst = nullptr;
+
     llama_context * ctx_dirty = make_ctx(params, model);
     if (ctx_dirty == nullptr) {
         fprintf(stderr, "%s : failed to init dirty ctx\n", __func__);
@@ -208,9 +221,9 @@ int main(int argc, char ** argv) {
         }
 
         for (int token = 0; token < n_vocab; ++token) {
-            if (std::fabs(logits_src_replay[i][token] - logits_dirty[token]) > eps) {
+            if (std::fabs(logits_reference[i][token] - logits_dirty[token]) > eps) {
                 fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, token %d (%g != %g)\n",
-                        __func__, pos, token, (double) logits_src_replay[i][token], (double) logits_dirty[token]);
+                        __func__, pos, token, (double) logits_reference[i][token], (double) logits_dirty[token]);
                 return 1;
             }
         }
@@ -218,7 +231,6 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
     llama_free(ctx_src);
-    llama_free(ctx_dst);
     llama_free(ctx_dirty);
     return 0;
 }

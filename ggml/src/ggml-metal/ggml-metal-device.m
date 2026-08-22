@@ -534,7 +534,81 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // bounded CPU-visible buffer for private transfers
+    id<MTLBuffer> staging_buffer;
+    void * staging_data;
+    size_t staging_buffer_size;
+    NSLock * queue_lock;
+    atomic_bool use_queue_lock;
 };
+
+#define GGML_METAL_STAGING_BUFFER_SIZE ((size_t) 16*1024*1024)
+
+static void * ggml_metal_host_malloc(size_t n) {
+    void * data = NULL;
+
+#if TARGET_OS_OSX
+    kern_return_t err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n, VM_FLAGS_ANYWHERE);
+    if (err != KERN_SUCCESS) {
+        GGML_LOG_ERROR("%s: error: vm_allocate failed\n", __func__);
+        return NULL;
+    }
+#else
+    const int result = posix_memalign((void **) &data, sysconf(_SC_PAGESIZE), n);
+    if (result != 0) {
+        GGML_LOG_ERROR("%s: error: posix_memalign failed\n", __func__);
+        return NULL;
+    }
+#endif
+
+    return data;
+}
+
+static void ggml_metal_host_free(void * data, size_t size) {
+    if (data == NULL) {
+        return;
+    }
+
+#if TARGET_OS_OSX
+    vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) data, size);
+#else
+    free(data);
+#endif
+}
+
+static void ggml_metal_device_init_staging_buffer(ggml_metal_device_t dev) {
+    if (dev->staging_buffer != nil) {
+        return;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const size_t size_min = page_size > 0 ? (size_t) page_size : 4096;
+
+    for (size_t size = GGML_METAL_STAGING_BUFFER_SIZE; size >= size_min; size /= 2) {
+        void * data = ggml_metal_host_malloc(size);
+        if (data == NULL) {
+            continue;
+        }
+
+        id<MTLBuffer> buffer = [dev->mtl_device newBufferWithBytesNoCopy:data
+                                                                  length:size
+                                                                 options:MTLResourceStorageModeShared
+                                                             deallocator:nil];
+        if (buffer != nil) {
+            dev->staging_buffer = buffer;
+            dev->staging_data = data;
+            dev->staging_buffer_size = size;
+            atomic_store_explicit(&dev->use_queue_lock, true, memory_order_release);
+            GGML_LOG_INFO("%s: reserved %.2f MiB shared staging buffer\n", __func__, size / 1024.0 / 1024.0);
+            return;
+        }
+
+        ggml_metal_host_free(data, size);
+    }
+
+    GGML_ABORT("%s: failed to reserve a CPU-visible Metal staging buffer\n", __func__);
+}
 
 //
 // MTLResidenceSet wrapper
@@ -725,6 +799,10 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
             }
 
+            dev->queue_lock = [[NSLock alloc] init];
+            GGML_ASSERT(dev->queue_lock);
+            atomic_init(&dev->use_queue_lock, false);
+
             dev->addr_virt = 0x000000400ULL;
 
             dev->props.device = device;
@@ -876,6 +954,10 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 dev->props.use_shared_buffers = true;
             }
 
+            if (!dev->props.use_shared_buffers) {
+                ggml_metal_device_init_staging_buffer(dev);
+            }
+
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
@@ -960,6 +1042,15 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     ggml_metal_library_free(dev->library);
     dev->library = NULL;
 
+    [dev->staging_buffer release];
+    dev->staging_buffer = nil;
+
+    ggml_metal_host_free(dev->staging_data, dev->staging_buffer_size);
+    dev->staging_data = NULL;
+
+    [dev->queue_lock release];
+    dev->queue_lock = nil;
+
     if (dev->mtl_queue) {
         [dev->mtl_queue release];
         dev->mtl_queue = nil;
@@ -979,6 +1070,21 @@ void * ggml_metal_device_get_obj(ggml_metal_device_t dev) {
 
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
     return dev->mtl_queue;
+}
+
+bool ggml_metal_device_lock_queue(ggml_metal_device_t dev) {
+    if (atomic_load_explicit(&dev->use_queue_lock, memory_order_acquire)) {
+        [dev->queue_lock lock];
+        return true;
+    }
+
+    return false;
+}
+
+void ggml_metal_device_unlock_queue(ggml_metal_device_t dev, bool locked) {
+    if (locked) {
+        [dev->queue_lock unlock];
+    }
 }
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
@@ -1535,6 +1641,22 @@ struct ggml_metal_buffer {
     ggml_metal_device_t dev;
 };
 
+static void ggml_metal_buffer_commit_and_wait(id<MTLCommandBuffer> cmd_buf, const char * func) {
+    if (cmd_buf == nil) {
+        GGML_ABORT("%s: failed to create Metal command buffer\n", func);
+    }
+
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+
+    const MTLCommandBufferStatus status = cmd_buf.status;
+    if (status != MTLCommandBufferStatusCompleted) {
+        NSError * error = cmd_buf.error;
+        const char * description = error ? error.localizedDescription.UTF8String : "unknown error";
+        GGML_ABORT("%s: Metal command buffer failed with status %d: %s\n", func, (int) status, description);
+    }
+}
+
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
 #ifndef GGML_METAL_NDEBUG
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
@@ -1614,26 +1736,6 @@ static void ggml_metal_buffer_rset_free(ggml_metal_buffer_t buf) {
 #endif
 }
 
-static void * ggml_metal_host_malloc(size_t n) {
-    void * data = NULL;
-
-#if TARGET_OS_OSX
-    kern_return_t err = vm_allocate((vm_map_t) mach_task_self(), (void *) &data, n, VM_FLAGS_ANYWHERE);
-    if (err != KERN_SUCCESS) {
-        GGML_LOG_ERROR("%s: error: vm_allocate failed\n", __func__);
-        return NULL;
-    }
-#else
-    const int result = posix_memalign((void **) &data, sysconf(_SC_PAGESIZE), n);
-    if (result != 0) {
-        GGML_LOG_ERROR("%s: error: posix_memalign failed\n", __func__);
-        return NULL;
-    }
-#endif
-
-    return data;
-}
-
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -1649,6 +1751,12 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
 
     shared = shared && props_dev->use_shared_buffers;
+
+    if (!shared) {
+        [dev->queue_lock lock];
+        ggml_metal_device_init_staging_buffer(dev);
+        [dev->queue_lock unlock];
+    }
 
     // allocate shared buffer if the device supports it and it is required by the buffer type
     if (shared) {
@@ -1827,31 +1935,60 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+static void ggml_metal_buffer_check_range(
+        const struct ggml_tensor * tensor,
+        struct ggml_metal_buffer_id bid,
+        size_t offset,
+        size_t size,
+        const char * func) {
+    const size_t tensor_size = ggml_nbytes(tensor);
+    if (offset > tensor_size || size > tensor_size - offset) {
+        GGML_ABORT("%s: tensor '%s' transfer range is out of bounds\n", func, tensor->name);
+    }
+
+    id<MTLBuffer> metal = bid.metal;
+    const size_t buffer_size = metal.length;
+    if (bid.offs > buffer_size || offset > buffer_size - bid.offs || size > buffer_size - bid.offs - offset) {
+        GGML_ABORT("%s: Metal buffer range for tensor '%s' is out of bounds\n", func, tensor->name);
+    }
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *) tensor->data + offset, value, size);
         return;
     }
 
+    if (size == 0) {
+        return;
+    }
+
     @autoreleasepool {
-        // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
-        bid_dst.offs += offset;
+        if (bid_dst.metal == nil) {
+            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+        }
+        ggml_metal_buffer_check_range(tensor, bid_dst, offset, size, __func__);
 
+        [buf->dev->queue_lock lock];
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
-
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-            [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, size)
-                          value:value];
-
-            [encoder endEncoding];
+        if (cmd_buf == nil) {
+            GGML_ABORT("%s: failed to create Metal command buffer\n", __func__);
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (encoder == nil) {
+            GGML_ABORT("%s: failed to create Metal blit encoder\n", __func__);
+        }
+
+        [encoder fillBuffer:bid_dst.metal
+                      range:NSMakeRange(bid_dst.offs + offset, size)
+                      value:value];
+
+        [encoder endEncoding];
+        ggml_metal_buffer_commit_and_wait(cmd_buf, __func__);
+
+        [buf->dev->queue_lock unlock];
     }
 }
 
@@ -1866,36 +2003,49 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // bytes-no-copy buffers require a page-aligned VM range.
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
-                                                                  options:MTLResourceStorageModeShared];
-
-        GGML_ASSERT(buf_src);
-
-        memcpy(buf_src.contents, data, size);
-
-        // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
-        bid_dst.offs += offset;
+        if (bid_dst.metal == nil) {
+            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+        }
+        ggml_metal_buffer_check_range(tensor, bid_dst, offset, size, __func__);
 
-        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+        [buf->dev->queue_lock lock];
 
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        id<MTLBuffer> staging_buffer = buf->dev->staging_buffer;
+        void * staging_data = buf->dev->staging_data;
+        GGML_ASSERT(staging_buffer);
+        GGML_ASSERT(staging_data);
 
-            [encoder copyFromBuffer:buf_src
-                       sourceOffset:0
-                           toBuffer:bid_dst.metal
-                  destinationOffset:bid_dst.offs
-                               size:size];
+        for (size_t done = 0; done < size;) {
+            const size_t chunk_size = buf->dev->staging_buffer_size < size - done ?
+                    buf->dev->staging_buffer_size : size - done;
 
-            [encoder endEncoding];
+            @autoreleasepool {
+                memcpy(staging_data, (const char *) data + done, chunk_size);
+
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+                if (cmd_buf == nil) {
+                    GGML_ABORT("%s: failed to create Metal command buffer\n", __func__);
+                }
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                if (encoder == nil) {
+                    GGML_ABORT("%s: failed to create Metal blit encoder\n", __func__);
+                }
+
+                [encoder copyFromBuffer:staging_buffer
+                           sourceOffset:0
+                               toBuffer:bid_dst.metal
+                      destinationOffset:bid_dst.offs + offset + done
+                                   size:chunk_size];
+
+                [encoder endEncoding];
+                ggml_metal_buffer_commit_and_wait(cmd_buf, __func__);
+            }
+
+            done += chunk_size;
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
-
-        [buf_src release];
+        [buf->dev->queue_lock unlock];
     }
 }
 
@@ -1910,36 +2060,48 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
     }
 
     @autoreleasepool {
-        // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
-        bid_src.offs += offset;
+        if (bid_src.metal == nil) {
+            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+        }
+        ggml_metal_buffer_check_range(tensor, bid_src, offset, size, __func__);
 
-        // Caller memory can have arbitrary alignment and length.
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
-                                                                  options:MTLResourceStorageModeShared];
+        [buf->dev->queue_lock lock];
 
-        GGML_ASSERT(buf_dst);
+        id<MTLBuffer> staging_buffer = buf->dev->staging_buffer;
+        const void * staging_data = buf->dev->staging_data;
+        GGML_ASSERT(staging_buffer);
+        GGML_ASSERT(staging_data);
 
-        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+        for (size_t done = 0; done < size;) {
+            const size_t chunk_size = buf->dev->staging_buffer_size < size - done ?
+                    buf->dev->staging_buffer_size : size - done;
 
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+            @autoreleasepool {
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+                if (cmd_buf == nil) {
+                    GGML_ABORT("%s: failed to create Metal command buffer\n", __func__);
+                }
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                if (encoder == nil) {
+                    GGML_ABORT("%s: failed to create Metal blit encoder\n", __func__);
+                }
 
-            [encoder copyFromBuffer:bid_src.metal
-                       sourceOffset:bid_src.offs
-                           toBuffer:buf_dst
-                  destinationOffset:0
-                               size:size];
+                [encoder copyFromBuffer:bid_src.metal
+                           sourceOffset:bid_src.offs + offset + done
+                               toBuffer:staging_buffer
+                      destinationOffset:0
+                                   size:chunk_size];
 
-            [encoder endEncoding];
+                [encoder endEncoding];
+                ggml_metal_buffer_commit_and_wait(cmd_buf, __func__);
+
+                memcpy((char *) data + done, staging_data, chunk_size);
+            }
+            done += chunk_size;
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
-
-        memcpy(data, buf_dst.contents, size);
-
-        [buf_dst release];
+        [buf->dev->queue_lock unlock];
     }
 }
 
@@ -1962,23 +2124,30 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
         if (bid_src.metal == nil || bid_dst.metal == nil) {
             return false;
         }
+        ggml_metal_buffer_check_range(src, bid_src, 0, size, __func__);
+        ggml_metal_buffer_check_range(dst, bid_dst, 0, size, __func__);
 
+        [buf_dst->dev->queue_lock lock];
         id<MTLCommandBuffer> cmd_buf = [buf_dst->dev->mtl_queue commandBufferWithUnretainedReferences];
-
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-            [encoder copyFromBuffer:bid_src.metal
-                       sourceOffset:bid_src.offs
-                           toBuffer:bid_dst.metal
-                  destinationOffset:bid_dst.offs
-                               size:size];
-
-            [encoder endEncoding];
+        if (cmd_buf == nil) {
+            GGML_ABORT("%s: failed to create Metal command buffer\n", __func__);
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (encoder == nil) {
+            GGML_ABORT("%s: failed to create Metal blit encoder\n", __func__);
+        }
+
+        [encoder copyFromBuffer:bid_src.metal
+                   sourceOffset:bid_src.offs
+                       toBuffer:bid_dst.metal
+              destinationOffset:bid_dst.offs
+                           size:size];
+
+        [encoder endEncoding];
+        ggml_metal_buffer_commit_and_wait(cmd_buf, __func__);
+
+        [buf_dst->dev->queue_lock unlock];
     }
 
     return true;
@@ -1991,20 +2160,25 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 
     @autoreleasepool {
+        [buf->dev->queue_lock lock];
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
-
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-            [encoder fillBuffer:buf->buffers[0].metal
-                          range:NSMakeRange(0, buf->buffers[0].size)
-                          value:value];
-
-            [encoder endEncoding];
+        if (cmd_buf == nil) {
+            GGML_ABORT("%s: failed to create Metal command buffer\n", __func__);
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        if (encoder == nil) {
+            GGML_ABORT("%s: failed to create Metal blit encoder\n", __func__);
+        }
+
+        [encoder fillBuffer:buf->buffers[0].metal
+                      range:NSMakeRange(0, buf->buffers[0].size)
+                      value:value];
+
+        [encoder endEncoding];
+        ggml_metal_buffer_commit_and_wait(cmd_buf, __func__);
+
+        [buf->dev->queue_lock unlock];
     }
 }
 
