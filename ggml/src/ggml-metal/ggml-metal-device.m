@@ -1583,12 +1583,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
                    (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
         case GGML_OP_PAD_REFLECT_1D:
-        case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_TIMESTEP_EMBEDDING:
+            // The legacy discrete kernel writes beyond the output for dim=320.
+            return dev->props.use_shared_buffers && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_LEAKY_RELU:
             return op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16;
         case GGML_OP_ARGSORT:
+            // Large sort grids return incorrect indices on legacy discrete Metal.
+            return dev->props.use_shared_buffers || op->src[0]->ne[0] <= 8192;
         case GGML_OP_TOP_K:
+            // The discrete path is correct through 4096 columns.
+            return dev->props.use_shared_buffers || op->src[0]->ne[0] <= 4096;
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_ROLL:
@@ -2170,7 +2176,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
             [encoder fillBuffer:bid_dst.metal
-                          range:NSMakeRange(bid_dst.offs, bid_dst.offs + size)
+                          range:NSMakeRange(bid_dst.offs, size)
                           value:value];
 
             [encoder endEncoding];
@@ -2187,23 +2193,22 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         return;
     }
 
+    if (size == 0) {
+        return;
+    }
+
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // bytes-no-copy buffers require a page-aligned VM range.
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
+
+        memcpy(buf_src.contents, data, size);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
-
-        // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
-        //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
-        dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
 
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
@@ -2219,19 +2224,10 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
             [encoder endEncoding];
         }
 
-        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-                             // TODO: can check for errors here
-            GGML_UNUSED(cb);
-
-            dispatch_semaphore_signal(completion_semaphore);
-        }];
-
         [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
 
-        dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
-        dispatch_release(completion_semaphore);
-
-        //[cmd_buf waitUntilCompleted];
+        [buf_src release];
     }
 }
 
@@ -2241,16 +2237,18 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         return;
     }
 
+    if (size == 0) {
+        return;
+    }
+
     @autoreleasepool {
         // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
 
-        // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // Caller memory can have arbitrary alignment and length.
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -2270,6 +2268,10 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+
+        memcpy(data, buf_dst.contents, size);
+
+        [buf_dst release];
     }
 }
 

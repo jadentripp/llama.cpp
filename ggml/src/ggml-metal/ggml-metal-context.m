@@ -133,8 +133,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
-    res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+    res->use_fusion = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+
+    // Multi-node graphs race on legacy discrete Metal devices.
+    res->use_concurrency = props_dev->use_shared_buffers && getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -336,50 +338,6 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         [encoder endEncoding];
         [cmd_buf commit];
         [buf_src release];
-
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
-
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
-
-        [cmd_buf retain];
-    }
-}
-
-void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    @autoreleasepool {
-        id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
-
-        GGML_ASSERT(buf_dst);
-
-        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
-        if (bid_src.metal == nil) {
-            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
-        }
-
-        bid_src.offs += offset;
-
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
-        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
-
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:buf_dst
-              destinationOffset:0
-                           size:size];
-
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_dst release];
 
         // do not wait here for completion
         //[cmd_buf waitUntilCompleted];

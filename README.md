@@ -14,6 +14,8 @@
 > **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+>
+> This checkout also keeps private-VRAM support and correctness fallbacks for Intel Macs with discrete AMD Radeon GPUs. See [Intel Mac AMD Metal support](docs/backend/INTEL-AMD-METAL.md).
 
 ---
 
