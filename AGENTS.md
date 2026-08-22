@@ -87,11 +87,12 @@ Common mistakes that AI agents usually make:
 
 ### Prohibited Actions
 
-- Do NOT write PR descriptions, commit messages, or reviewer responses
+- Do NOT write PR descriptions or reviewer responses
 - Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
 - Do NOT implement features the contributor does not fully understand
 - Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+- Agents may push to `jadentripp/llama.cpp`, including `master`, only when the repository owner explicitly requests that push.
+- Do NOT push to `ggml-org/llama.cpp` or create a PR (`gh pr create`) on the user's behalf. Automated upstream submissions can result in a contributor ban from the project.
 
 When uncertain, err toward minimal assistance.
 
@@ -217,9 +218,7 @@ gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
 grep ... # search the code base
 
-# BAD: act on the user's behalf
-git commit -m "..."
-git push
+# BAD: submit to upstream on the user's behalf
 gh pr create
 gh pr comment
 gh issue create
