@@ -505,12 +505,6 @@ static void ggml_backend_metal_set_tensor_async(ggml_backend_t backend, ggml_ten
     ggml_metal_set_tensor_async(ctx, tensor, data, offset, size);
 }
 
-static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_get_tensor_async(ctx, tensor, data, offset, size);
-}
-
 static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
         return false;
@@ -570,7 +564,8 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
     /* .set_tensor_async        = */ ggml_backend_metal_set_tensor_async,
-    /* .get_tensor_async        = */ ggml_backend_metal_get_tensor_async,
+    // Use the page-safe synchronized path for private buffers.
+    /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ ggml_backend_metal_cpy_tensor_async, // only needed for multi-GPU setups
@@ -671,6 +666,10 @@ static enum ggml_backend_dev_type ggml_backend_metal_device_get_type(ggml_backen
 }
 
 static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
     props->name        = ggml_backend_metal_device_get_name(dev);
     props->description = ggml_backend_metal_device_get_description(dev);
     props->type        = ggml_backend_metal_device_get_type(dev);
@@ -680,7 +679,8 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
     props->caps = {
         /* .async                = */ true,
         /* .host_buffer          = */ false,
-        /* .buffer_from_host_ptr = */ true,
+        // Discrete GPUs need private buffers for model weights.
+        /* .buffer_from_host_ptr = */ props_dev->use_shared_buffers,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
     };

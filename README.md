@@ -1,5 +1,8 @@
 # llama.cpp
 
+> [!NOTE]
+> This fork adds private-VRAM support and correctness fallbacks for Intel Macs with discrete AMD Radeon GPUs. See [Intel Mac AMD Metal support](docs/backend/INTEL-AMD-METAL.md).
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
