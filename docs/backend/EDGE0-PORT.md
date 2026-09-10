@@ -25,7 +25,8 @@ The merge retains this fork's Intel/AMD Metal private buffers, bounded 16 MiB tr
 | Checkpoint replay | Model state plus routing state reproduced the next-step logits exactly |
 | Android arm64 CPU | Cross-compiled with NDK r28c, API 28; system-library-only executable dependencies |
 | Android arm64 Vulkan | Cross-compiled with NDK r28c, host glslc, Vulkan and SPIR-V headers |
-| Intel Mac / Pixel execution | Not run on physical devices in this environment |
+| Hosted Intel Mac | Metal build and all 18 CPU streaming cases passed on macos-15-intel; downloadable artifact produced |
+| Mac GPU / Pixel execution | Not run on physical devices in this environment |
 | Qwen 35B metadata and adapters | 733 base tensor names mapped; 620 LoRA factors and 99 head matrices converted; tokenizer metadata prepared |
 | Full 35B model generation | Not run; full-model conversion and inference remain experimental |
 | Parity with MLX / quality benchmark | Not established; CPU equivalence above compares two paths in this fork |
@@ -56,7 +57,7 @@ Convert on a desktop, then copy the three GGUFs to the target device. The conver
 ```sh
 python3 -m venv .venv-edge0
 . .venv-edge0/bin/activate
-python -m pip install -r requirements/requirements-convert_hf_to_gguf.txt
+python -m pip install -r requirements/requirements-convert_edge0_to_gguf.txt
 hf download Edge0/Edge0-8B-A1B-preview --revision 0bf17abed23b7de4b66e265a3848e80447ee7b41 --local-dir models/edge0-8b-mlx
 python convert_edge0_to_gguf.py models/edge0-8b-mlx --output-dir models/edge0-8b-gguf
 python scripts/edge0/render-prompt.py models/edge0-8b-mlx 'What is the capital of France?' > prompt.txt

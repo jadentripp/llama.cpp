@@ -12,10 +12,25 @@ build=${EDGE0_BUILD_DIR:-"$root/build-edge0-android-$backend"}
 extra=()
 if [[ $backend == vulkan ]]; then
     extra+=(-DGGML_VULKAN=ON)
-    if [[ -n ${VULKAN_SDK:-} ]]; then
-        extra+=("-DVulkan_INCLUDE_DIR=$VULKAN_SDK/include")
+    source_headers=''
+    if [[ -n ${VULKAN_SDK:-} && -f $VULKAN_SDK/include/vulkan/vulkan.hpp ]]; then
+        source_headers=$VULKAN_SDK/include
     elif [[ -f /usr/include/vulkan/vulkan.hpp ]]; then
-        extra+=(-DVulkan_INCLUDE_DIR=/usr/include)
+        source_headers=/usr/include
+    fi
+    if [[ -n $source_headers ]]; then
+        # CMake can remove /usr/include as an implicit host path during an NDK
+        # cross-build. Copy the platform-neutral Vulkan/SPIR-V headers so Android
+        # never searches the host's libc headers and still finds vulkan.hpp.
+        mkdir -p "$build/vulkan-headers"
+        cp -R "$source_headers/vulkan" "$build/vulkan-headers/"
+        if [[ -d $source_headers/vk_video ]]; then
+            cp -R "$source_headers/vk_video" "$build/vulkan-headers/"
+        fi
+        if [[ -d $source_headers/spirv ]]; then
+            cp -R "$source_headers/spirv" "$build/vulkan-headers/"
+        fi
+        extra+=("-DVulkan_INCLUDE_DIR=$build/vulkan-headers")
     fi
     if command -v glslc >/dev/null; then
         extra+=("-DVulkan_GLSLC_EXECUTABLE=$(command -v glslc)")

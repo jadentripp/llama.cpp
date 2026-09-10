@@ -74,6 +74,14 @@ class Converter:
             def index_tensors(self, remote_hf_model_id=None):
                 return {}
 
+            def get_vocab_base(self):
+                # The Qwen release names the Transformers 5 TokenizersBackend
+                # class. Its tokenizer.json also works with this fork's pinned
+                # Transformers 4 fast tokenizer, without remote model code.
+                from transformers import PreTrainedTokenizerFast
+                tokenizer = PreTrainedTokenizerFast.from_pretrained(self.dir_model)
+                return self._get_vocab_base(tokenizer)
+
         self.model = MetadataOnly(directory, gguf.LlamaFileType.MOSTLY_Q4_1, output / "base.gguf", hparams=config)
         self.model.hparams["num_experts_per_tok"] = self.top_k
         self.mapping = self.model.tensor_map
