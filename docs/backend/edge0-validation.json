@@ -1,0 +1,28 @@
+{
+  "date": "2026-09-10",
+  "upstream_commit": "d344123fe2de081a72e02d6869360dfcbc0b528b",
+  "edge0_reference": "a38d3dae7ed9c24d44f62c455f3c7ac67345d844",
+  "edge0_8b_release": "0bf17abed23b7de4b66e265a3848e80447ee7b41",
+  "cpu_streaming_cases": 18,
+  "conversion_numerical_tests": 6,
+  "real_8b_streaming_comparison": {
+    "values": 1257472,
+    "max_abs_error": 0.0,
+    "normalized_squared_error": 0.0
+  },
+  "checkpoint_replay_nmse": 0.0,
+  "qwen35_header_names_mapped": 733,
+  "qwen35_lora_factors_converted": 620,
+  "qwen35_head_matrices_converted": 99,
+  "android_ndk": "28.2.13676358",
+  "android_abi": "arm64-v8a",
+  "android_api": 28,
+  "android_cpu_cross_build": "passed",
+  "android_vulkan_cross_build": "passed",
+  "metal_execution": "not run",
+  "pixel_execution": "not run",
+  "full_35b_generation": "not run",
+  "mlx_parity": "not established",
+  "software_vulkan_streaming_cases": 18,
+  "software_vulkan_driver": "Mesa 24.0.5 llvmpipe"
+}

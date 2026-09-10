@@ -82,6 +82,14 @@ static bool run(ggml_backend_t target, ggml_backend_t cpu, ggml_type type, int b
             fprintf(stderr, "expert tensor was not compacted\n");
             ok = false;
         }
+        if (batch * used <= 4 && ggml_backend_sched_get_tensor_backend(sched, y) != target) {
+            fprintf(stderr, "compact operation did not execute on the requested backend\n");
+            ok = false;
+        }
+        if (batch * used > 4 && (y->src[0] != w || ggml_backend_sched_get_tensor_backend(sched, y) != cpu)) {
+            fprintf(stderr, "oversized operation did not preserve the CPU fallback\n");
+            ok = false;
+        }
 
         ggml_context * ref = ggml_init({ 16 * ggml_tensor_overhead() + ggml_graph_overhead_custom(64, false), nullptr, true });
         ggml_tensor * rx = ggml_new_tensor_3d(ref, GGML_TYPE_F32, width, used, batch);

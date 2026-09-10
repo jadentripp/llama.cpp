@@ -1,0 +1,60 @@
+name: Edge0 portable builds
+
+on:
+  push:
+    branches: ['work/edge0-port-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edge0-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  intel-mac:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build Intel Metal tools
+        run: bash scripts/edge0/build-mac.sh
+      - name: CPU streaming checks
+        run: build-edge0-metal/bin/test-moe-stream
+      - uses: actions/upload-artifact@v6
+        with:
+          name: edge0-intel-mac
+          path: |
+            build-edge0-metal/bin/llama-completion
+            build-edge0-metal/bin/llama-edge0
+            build-edge0-metal/bin/llama-bench
+            build-edge0-metal/bin/test-moe-stream
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        backend: [cpu, vulkan]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Install build dependencies
+        run: |
+          sdkmanager 'ndk;28.2.13676358'
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y glslc libvulkan-dev spirv-headers
+      - name: Build Android tools
+        run: bash scripts/edge0/build-android.sh '${{ matrix.backend }}'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: edge0-android-arm64-${{ matrix.backend }}
+          path: |
+            build-edge0-android-${{ matrix.backend }}/bin/llama-completion
+            build-edge0-android-${{ matrix.backend }}/bin/llama-edge0
+            build-edge0-android-${{ matrix.backend }}/bin/llama-bench
+            build-edge0-android-${{ matrix.backend }}/bin/test-moe-stream
+          if-no-files-found: error
