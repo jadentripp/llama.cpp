@@ -199,6 +199,8 @@ add_library(ggml-base
             ggml.c
             ggml.cpp
             ggml-alloc.c
+            ggml-moe-stream.cpp
+            ggml-moe-stream.h
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp

@@ -1078,14 +1078,14 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
+    if (!force && mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1332,9 +1332,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
-        // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+    const char * stream_env = getenv("GGML_MOE_STREAM");
+    const bool stream_expert = stream_env && strcmp(stream_env, "1") == 0 &&
+        (tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_EXPS ||
+         tn.tensor == LLM_TENSOR_FFN_UP_EXPS || tn.tensor == LLM_TENSOR_FFN_GATE_UP_EXPS);
+    if ((flags & TENSOR_READ_LAZY) || stream_expert) {
+        // Match the memory-fit pass, even when it has no mappings.
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), stream_expert);
     }
 
     ggml_tensor t_meta = *cur;

@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-moe-stream.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -830,6 +831,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    ggml_moe_stream * moe;
 
     int debug;
 
@@ -946,6 +948,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         cur_backend_id = sched->n_backends - 1; // last backend (assumed CPU)
         SET_CAUSE(tensor, "1.inp");
         return cur_backend_id;
+    }
+
+    if (sched->moe->candidate(tensor)) {
+        if (!sched->moe->fits(tensor)) {
+            return sched->n_backends - 1;
+        }
+        for (int b = 0; sched->op_offload && b < sched->n_backends - 1; ++b) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) {
+                return b;
+            }
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights
@@ -1082,6 +1095,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
+    sched->moe->ops.clear();
     graph->uid = ggml_graph_next_uid();
 
     // pass 1: assign backends to ops with pre-allocated inputs
@@ -1321,8 +1335,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
-            // check if we should start a new split based on the sources of the current node
-            bool need_new_split = false;
+            const bool stream_node = sched->moe->candidate(node) && sched->moe->fits(node) &&
+                (node_backend_id != sched->n_backends - 1 || sched->moe->cpu);
+
+            // Routing must complete before the compact expert inputs are filled.
+            bool need_new_split = stream_node && i > split->i_start;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
@@ -1361,8 +1378,28 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 cur_backend_id = node_backend_id;
             }
 
+            if (stream_node) {
+                ggml_tensor * source = node->src[0];
+                ggml_tensor * source_ids = node->src[2];
+                const int64_t slots = std::min(source->ne[2], source_ids->ne[0] * source_ids->ne[1]);
+                ggml_tensor * weights = ggml_new_tensor_3d(sched->ctx, source->type, source->ne[0], source->ne[1], slots);
+                ggml_tensor * ids = ggml_new_tensor_2d(sched->ctx, GGML_TYPE_I32, source_ids->ne[0], source_ids->ne[1]);
+                ggml_format_name(weights, "moe#%s", source->name);
+                ggml_format_name(ids, "moe#%s", source_ids->name);
+                weights->src[0] = source;
+                ids->src[0] = source_ids;
+                tensor_backend_id(weights) = cur_backend_id;
+                tensor_backend_id(ids) = cur_backend_id;
+                node->src[0] = weights;
+                node->src[2] = ids;
+                sched->moe->ops.push_back({ i_split, source, source_ids, weights, ids });
+            }
+
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (stream_node && (j == 0 || j == 2)) {
+                    continue;
+                }
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {
                     continue;
@@ -1472,7 +1509,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + 2 * sched->moe->ops.size();
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1494,6 +1531,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
+
+        for (const auto & op : sched->moe->ops) {
+            if (op.split == i) {
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = op.weights;
+                sched->node_backend_ids[graph_copy->n_nodes] = split->backend_id;
+                graph_copy->nodes[graph_copy->n_nodes++] = op.ids;
+            }
+        }
 
         // add inputs to the graph copy so that they are allocated by ggml-alloc at the start of the split
         for (int j = 0; j < split->n_inputs; j++) {
@@ -1788,6 +1834,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        for (const auto & op : sched->moe->ops) {
+            if (op.split != split_id) {
+                continue;
+            }
+            ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, op.source_ids);
+            if (!sched->moe->prepare(op, split_backend, ids_backend)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1904,6 +1960,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->moe = new ggml_moe_stream();
 
     ggml_backend_sched_reset(sched);
 
@@ -1914,6 +1971,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_backend_sched_synchronize(sched);
+    delete sched->moe;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
