@@ -15,7 +15,7 @@
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
 >
-> This checkout also keeps private-VRAM support and correctness fallbacks for Intel Macs with discrete AMD Radeon GPUs. See [Intel Mac AMD Metal support](docs/backend/INTEL-AMD-METAL.md).
+> This checkout also keeps private-VRAM support and correctness fallbacks for Intel Macs with discrete AMD Radeon GPUs. See [Intel Mac AMD Metal support](docs/backend/INTEL-AMD-METAL.md). Bonsai 2 27B PTQ1_0 tokens/s versus context on the 5500M is in [BONSAI2-5500M-CONTEXT.md](docs/backend/BONSAI2-5500M-CONTEXT.md).
 
 ---
 

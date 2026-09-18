@@ -79,3 +79,5 @@ Checkpoint validation used base commit `de0fa5c8f` (build 10589) on the same Rad
 - A single-slot llama-server created and restored a 50.251 MiB context checkpoint with `--cache-ram 0`. Identical greedy requests produced byte-identical responses before and after restore.
 - Pi completed one real tool-call round trip with checkpoints enabled on Qwen3.8 9B Q5_K_M at 128K and Q4_K_M at 256K. The short restore probe used a zero checkpoint spacing override; the launcher keeps the server default spacing for normal use.
 - The 128K Q5 server had a 7.0 GiB peak physical footprint. Both full profiles remained swap-free, reported no memory-pressure throttling, and loaded with fit targets of 1024 MiB and 900 MiB respectively. AMD recovery and VRAM-eviction wait counters remained zero, and no new GPU restart diagnostic was created.
+
+Ternary Bonsai 2 27B PTQ1_0 throughput versus allocated and filled context on this same 5500M is recorded in [BONSAI2-5500M-CONTEXT.md](BONSAI2-5500M-CONTEXT.md).
